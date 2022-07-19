@@ -2,9 +2,9 @@ package timingwheel
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/RussellLuo/timingwheel/delayqueue"
 )
@@ -12,8 +12,11 @@ import (
 // TimingWheel is an implementation of Hierarchical Timing Wheels.
 type TimingWheel struct {
 	tick      int64 // in milliseconds
+	pointer   int64
 	wheelSize int64
+	layer     int64
 
+	layers      int64
 	interval    int64 // in milliseconds
 	currentTime int64 // in milliseconds
 	buckets     []*bucket
@@ -22,136 +25,202 @@ type TimingWheel struct {
 	// The higher-level overflow wheel.
 	//
 	// NOTE: This field may be updated and read concurrently, through Add().
-	overflowWheel unsafe.Pointer // type: *TimingWheel
+	overflowWheel *TimingWheel // type: *TimingWheel
+	// shuntflowWheel *TimingWheel
 
 	exitC     chan struct{}
 	waitGroup waitGroupWrapper
 }
 
 // NewTimingWheel creates an instance of TimingWheel with the given tick and wheelSize.
-func NewTimingWheel(tick time.Duration, wheelSize int64) *TimingWheel {
-	tickMs := int64(tick / time.Millisecond)
-	if tickMs <= 0 {
-		panic(errors.New("tick must be greater than or equal to 1ms"))
+func NewTimingWheel(tick time.Duration, wheelSize int64, layers int64) *TimingWheel {
+	tickSec := int64(tick / time.Second)
+	if tickSec <= 0 {
+		panic(errors.New("tick must be greater than or equal to 1s"))
 	}
 
-	startMs := timeToMs(time.Now().UTC())
+	now := time.Now()
+	startSec := timeToSec(now.UTC())
+	fmt.Printf("startSec: %d, %s\n", startSec, now.Format("2006-01-02 15:04:05.000"))
 
 	return newTimingWheel(
-		tickMs,
+		tickSec,
 		wheelSize,
-		startMs,
+		1,
+		layers,
+		startSec,
 		delayqueue.New(int(wheelSize)),
 	)
 }
 
 // newTimingWheel is an internal helper function that really creates an instance of TimingWheel.
-func newTimingWheel(tickMs int64, wheelSize int64, startMs int64, queue *delayqueue.DelayQueue) *TimingWheel {
-	buckets := make([]*bucket, wheelSize)
-	for i := range buckets {
-		buckets[i] = newBucket()
+func newTimingWheel(tickSec int64, wheelSize int64, layer int64, layers int64, startSec int64, queue *delayqueue.DelayQueue) *TimingWheel {
+	var buckets []*bucket
+	if layer > layers {
+		buckets = make([]*bucket, 0)
+	} else {
+		buckets = make([]*bucket, wheelSize)
+		for i := range buckets {
+			buckets[i] = newBucket()
+		}
 	}
+
+	var overflowWheel *TimingWheel = nil
+	if layer <= layers {
+		overflowWheel = newTimingWheel(
+			tickSec*wheelSize,
+			wheelSize,
+			layer+1,
+			layers,
+			startSec,
+			delayqueue.New(int(wheelSize)),
+		)
+	}
+
 	return &TimingWheel{
-		tick:        tickMs,
-		wheelSize:   wheelSize,
-		currentTime: truncate(startMs, tickMs),
-		interval:    tickMs * wheelSize,
-		buckets:     buckets,
-		queue:       queue,
-		exitC:       make(chan struct{}),
+		tick:      tickSec,
+		pointer:   0,
+		wheelSize: wheelSize,
+		layer:     layer,
+		layers:    layers,
+		// currentTime:   truncate(startMs, tickMs),
+		currentTime:   startSec,
+		interval:      tickSec * wheelSize,
+		buckets:       buckets,
+		queue:         queue,
+		overflowWheel: overflowWheel,
+		exitC:         make(chan struct{}),
 	}
+}
+
+// func setcap(b []*bucket, cap int) []*bucket {
+// 	s := make([]*bucket, cap)
+// 	copy(s, b)
+// 	return s
+// }
+
+func (tw *TimingWheel) Add(d time.Duration, f func()) *Timer {
+	t := &Timer{
+		id:         int64(d / time.Second),
+		expiration: timeToSec(time.Now().UTC().Add(d)),
+		task:       f,
+	}
+	tw.add(t)
+	return t
 }
 
 // add inserts the timer t into the current timing wheel.
 func (tw *TimingWheel) add(t *Timer) bool {
-	currentTime := atomic.LoadInt64(&tw.currentTime)
-	if t.expiration < currentTime+tw.tick {
+	// currentTime := atomic.LoadInt64(&tw.currentTime)
+	currentTime := timeToSec(time.Now().UTC())
+	// fmt.Printf("add layer[%d] tick[%d] interval[%d] expiration[%d] currentTime[%d]\n", tw.layer, tw.tick, tw.interval, t.expiration, currentTime)
+	if (tw.layer == 1) && (t.expiration <= currentTime) {
 		// Already expired
-		return false
+		t.task()
+		return true
 	} else if t.expiration < currentTime+tw.interval {
 		// Put it into its own bucket
-		virtualID := t.expiration / tw.tick
-		b := tw.buckets[virtualID%tw.wheelSize]
-		b.Add(t)
+		virtualID := (t.expiration - currentTime) / tw.tick
 
-		// Set the bucket expiration time
-		if b.SetExpiration(virtualID * tw.tick) {
-			// The bucket needs to be enqueued since it was an expired bucket.
-			// We only need to enqueue the bucket when its expiration time has changed,
-			// i.e. the wheel has advanced and this bucket get reused with a new expiration.
-			// Any further calls to set the expiration within the same wheel cycle will
-			// pass in the same value and hence return false, thus the bucket with the
-			// same expiration will not be enqueued multiple times.
-			tw.queue.Offer(b, b.Expiration())
-		}
+		// fmt.Printf("task[%d] insert layer[%d] index: %d\n", t.expiration, tw.layer, (t.expiration-currentTime)/tw.tick)
+		b := tw.buckets[(tw.pointer+virtualID)%tw.wheelSize]
+		// b := tw.buckets[(tw.pointer+virtualID)%tw.wheelSize]
+		b.Add(t)
 
 		return true
 	} else {
-		// Out of the interval. Put it into the overflow wheel
-		overflowWheel := atomic.LoadPointer(&tw.overflowWheel)
-		if overflowWheel == nil {
-			atomic.CompareAndSwapPointer(
-				&tw.overflowWheel,
-				nil,
-				unsafe.Pointer(newTimingWheel(
-					tw.interval,
-					tw.wheelSize,
-					currentTime,
-					tw.queue,
-				)),
-			)
-			overflowWheel = atomic.LoadPointer(&tw.overflowWheel)
+		if tw.layer <= tw.layers {
+			// Out of the interval. Put it into the overflow wheel
+			return tw.overflowWheel.add(t)
+		} else {
+			// Put it into its own bucket
+			virtualID := t.expiration / tw.tick
+			if cap(tw.buckets) < int(virtualID) {
+				tw.buckets = setcap(tw.buckets, int(virtualID))
+			}
+			if tw.buckets[virtualID] == nil {
+				tw.buckets[virtualID] = newBucket()
+			}
+
+			b := tw.buckets[virtualID]
+			b.Add(t)
+			return true
 		}
-		return (*TimingWheel)(overflowWheel).add(t)
 	}
 }
 
-// addOrRun inserts the timer t into the current timing wheel, or run the
-// timer's task if it has already expired.
-func (tw *TimingWheel) addOrRun(t *Timer) {
-	if !tw.add(t) {
-		// Already expired
-
-		// Like the standard time.AfterFunc (https://golang.org/pkg/time/#AfterFunc),
-		// always execute the timer's task in its own goroutine.
-		go t.task()
-	}
+func (tw *TimingWheel) handler(t *Timer) {
+	t.task()
 }
 
-func (tw *TimingWheel) advanceClock(expiration int64) {
-	currentTime := atomic.LoadInt64(&tw.currentTime)
-	if expiration >= currentTime+tw.tick {
-		currentTime = truncate(expiration, tw.tick)
-		atomic.StoreInt64(&tw.currentTime, currentTime)
+func (tw *TimingWheel) reinsert(t *Timer) {
+	tw.add(t)
+}
 
-		// Try to advance the clock of the overflow wheel if present
-		overflowWheel := atomic.LoadPointer(&tw.overflowWheel)
-		if overflowWheel != nil {
-			(*TimingWheel)(overflowWheel).advanceClock(currentTime)
+func (tw *TimingWheel) load(reinsert func(*Timer)) {
+	endPointer := (tw.pointer + 2) % tw.wheelSize
+	index := (tw.pointer + 1) % tw.wheelSize
+	for {
+		if tw.pointer == endPointer {
+			return
 		}
+		if tw.buckets[index].timers.Len() > 0 {
+			tw.buckets[index].Load(reinsert)
+		}
+		time.Sleep(100 * time.Millisecond)
+		// time.Sleep(time.Duration(tw.tick / tw.wheelSize))
 	}
 }
 
 // Start starts the current timing wheel.
 func (tw *TimingWheel) Start() {
-	tw.waitGroup.Wrap(func() {
-		tw.queue.Poll(tw.exitC, func() int64 {
-			return timeToMs(time.Now().UTC())
-		})
-	})
+	var (
+		i int64 = 0
+	)
 
+	if tw.layer == 1 {
+		for i = 0; i < tw.wheelSize; i++ {
+			num := i
+			go func(index int64) {
+				for {
+					if tw.buckets[index].timers.Len() > 0 {
+						tw.buckets[index].Flush(tw.handler)
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
+			}(num)
+		}
+	}
+
+	start := atomic.LoadInt64(&tw.currentTime)
 	tw.waitGroup.Wrap(func() {
 		for {
-			select {
-			case elem := <-tw.queue.C:
-				b := elem.(*bucket)
-				tw.advanceClock(b.Expiration())
-				b.Flush(tw.addOrRun)
-			case <-tw.exitC:
-				return
+			now := timeToSec(time.Now().UTC())
+			if (now - start) >= tw.tick {
+				tw.pointer = (tw.pointer + 1) % tw.wheelSize
+				fmt.Printf("===TimingWheel[%d]=== pointer[%d] time[%s]\n", tw.layer, tw.pointer, time.Now().Format("2006-01-02 15:04:05.000"))
+				start = now
+				if tw.pointer == (tw.wheelSize - 1) {
+					// fmt.Printf("timerWheel[layer%d] load from overflowWheel[layer%d]\n", tw.layer, tw.overflowWheel.layer)
+					// start load
+					// if tw.layer == 1 {
+					// 	tw.Show()
+					// }
+					go tw.overflowWheel.load(tw.reinsert)
+				}
 			}
+			// time.Sleep(20 * time.Millisecond)
+			time.Sleep(time.Duration(tw.tick / 50))
 		}
 	})
+
+	if tw.layer == tw.layers {
+		return
+	}
+	tw.waitGroup.Wrap(func() {
+		tw.overflowWheel.Start()
+	})
+	// go (*TimingWheel)(tw.overflowWheel).Start()
 }
 
 // Stop stops the current timing wheel.
@@ -164,63 +233,26 @@ func (tw *TimingWheel) Stop() {
 	tw.waitGroup.Wait()
 }
 
-// AfterFunc waits for the duration to elapse and then calls f in its own goroutine.
-// It returns a Timer that can be used to cancel the call using its Stop method.
-func (tw *TimingWheel) AfterFunc(d time.Duration, f func()) *Timer {
-	t := &Timer{
-		expiration: timeToMs(time.Now().UTC().Add(d)),
-		task:       f,
+func (tw *TimingWheel) Show() {
+	fmt.Printf("layer: %d\n", tw.layer)
+	for i := 0; i < int(tw.wheelSize); i++ {
+		len := tw.buckets[i].timers.Len()
+		if len != 0 {
+			fmt.Printf("i: %d, len: %d\n", i, len)
+		}
 	}
-	tw.addOrRun(t)
-	return t
-}
-
-// Scheduler determines the execution plan of a task.
-type Scheduler interface {
-	// Next returns the next execution time after the given (previous) time.
-	// It will return a zero time if no next time is scheduled.
-	//
-	// All times must be UTC.
-	Next(time.Time) time.Time
-}
-
-// ScheduleFunc calls f (in its own goroutine) according to the execution
-// plan scheduled by s. It returns a Timer that can be used to cancel the
-// call using its Stop method.
-//
-// If the caller want to terminate the execution plan halfway, it must
-// stop the timer and ensure that the timer is stopped actually, since in
-// the current implementation, there is a gap between the expiring and the
-// restarting of the timer. The wait time for ensuring is short since the
-// gap is very small.
-//
-// Internally, ScheduleFunc will ask the first execution time (by calling
-// s.Next()) initially, and create a timer if the execution time is non-zero.
-// Afterwards, it will ask the next execution time each time f is about to
-// be executed, and f will be called at the next execution time if the time
-// is non-zero.
-func (tw *TimingWheel) ScheduleFunc(s Scheduler, f func()) (t *Timer) {
-	expiration := s.Next(time.Now().UTC())
-	if expiration.IsZero() {
-		// No time is scheduled, return nil.
-		return
+	fmt.Printf("layer: %d\n", tw.overflowWheel.layer)
+	for i := 0; i < int(tw.overflowWheel.wheelSize); i++ {
+		len := tw.overflowWheel.buckets[i].timers.Len()
+		if len != 0 {
+			fmt.Printf("i: %d, len: %d\n", i, len)
+		}
 	}
-
-	t = &Timer{
-		expiration: timeToMs(expiration),
-		task: func() {
-			// Schedule the task to execute at the next time if possible.
-			expiration := s.Next(msToTime(t.expiration))
-			if !expiration.IsZero() {
-				t.expiration = timeToMs(expiration)
-				tw.addOrRun(t)
-			}
-
-			// Actually execute the task.
-			f()
-		},
+	fmt.Printf("layer: %d\n", tw.overflowWheel.overflowWheel.layer)
+	for i := 0; i < int(tw.overflowWheel.overflowWheel.wheelSize); i++ {
+		len := tw.overflowWheel.overflowWheel.buckets[i].timers.Len()
+		if len != 0 {
+			fmt.Printf("i: %d, len: %d\n", i, len)
+		}
 	}
-	tw.addOrRun(t)
-
-	return
 }

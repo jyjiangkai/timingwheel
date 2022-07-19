@@ -1,42 +1,42 @@
 package timingwheel_test
 
-import (
-	"fmt"
-	"time"
+// import (
+// 	"fmt"
+// 	"time"
 
-	"github.com/RussellLuo/timingwheel"
-)
+// 	"github.com/RussellLuo/timingwheel"
+// )
 
-func Example_startTimer() {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
-	tw.Start()
-	defer tw.Stop()
+// func Example_startTimer() {
+// 	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+// 	tw.Start()
+// 	defer tw.Stop()
 
-	exitC := make(chan time.Time, 1)
-	tw.AfterFunc(time.Second, func() {
-		fmt.Println("The timer fires")
-		exitC <- time.Now().UTC()
-	})
+// 	exitC := make(chan time.Time, 1)
+// 	tw.AfterFunc(time.Second, func() {
+// 		fmt.Println("The timer fires")
+// 		exitC <- time.Now().UTC()
+// 	})
 
-	<-exitC
+// 	<-exitC
 
-	// Output:
-	// The timer fires
-}
+// 	// Output:
+// 	// The timer fires
+// }
 
-func Example_stopTimer() {
-	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
-	tw.Start()
-	defer tw.Stop()
+// func Example_stopTimer() {
+// 	tw := timingwheel.NewTimingWheel(time.Millisecond, 20)
+// 	tw.Start()
+// 	defer tw.Stop()
 
-	t := tw.AfterFunc(time.Second, func() {
-		fmt.Println("The timer fires")
-	})
+// 	t := tw.AfterFunc(time.Second, func() {
+// 		fmt.Println("The timer fires")
+// 	})
 
-	<-time.After(900 * time.Millisecond)
-	// Stop the timer before it fires
-	t.Stop()
+// 	<-time.After(900 * time.Millisecond)
+// 	// Stop the timer before it fires
+// 	t.Stop()
 
-	// Output:
-	//
-}
+// 	// Output:
+// 	//
+// }

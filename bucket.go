@@ -4,12 +4,14 @@ import (
 	"container/list"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
 // Timer represents a single event. When the Timer expires, the given
 // task will be executed.
 type Timer struct {
+	id         int64
 	expiration int64 // in milliseconds
 	task       func()
 
@@ -111,7 +113,7 @@ func (b *bucket) Remove(t *Timer) bool {
 	return b.remove(t)
 }
 
-func (b *bucket) Flush(reinsert func(*Timer)) {
+func (b *bucket) Flush(handler func(*Timer)) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
@@ -119,6 +121,32 @@ func (b *bucket) Flush(reinsert func(*Timer)) {
 		next := e.Next()
 
 		t := e.Value.(*Timer)
+		if t.expiration > time.Now().Unix() {
+			return
+		}
+		// fmt.Printf("remove: %d\n", t.expiration)
+		b.remove(t)
+		// Note that this operation will either execute the timer's task, or
+		// insert the timer into another bucket belonging to a lower-level wheel.
+		//
+		// In either case, no further lock operation will happen to b.mu.
+		handler(t)
+
+		e = next
+	}
+
+	// b.SetExpiration(-1)
+}
+
+func (b *bucket) Load(reinsert func(*Timer)) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for e := b.timers.Front(); e != nil; {
+		next := e.Next()
+
+		t := e.Value.(*Timer)
+		// fmt.Printf("bucket remove, id: %d\n", t.id)
 		b.remove(t)
 		// Note that this operation will either execute the timer's task, or
 		// insert the timer into another bucket belonging to a lower-level wheel.
@@ -129,5 +157,5 @@ func (b *bucket) Flush(reinsert func(*Timer)) {
 		e = next
 	}
 
-	b.SetExpiration(-1)
+	// b.SetExpiration(-1)
 }
